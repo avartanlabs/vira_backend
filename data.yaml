@@ -1,0 +1,65 @@
+train: /data1/puneeth/saligao_training/Saligao_dataset/Dataset_saligao.v2i.yolov8/train  # Update this with the actual path to your train folder
+val: /data1/puneeth/saligao_training/Saligao_dataset/Dataset_saligao.v2i.yolov8/test  # Update this with the actual path to your test folder
+nc: 19
+names:
+  0: pet-bottle-clear
+  1: pet-bottle-green
+  2: ldpe-clear
+  3: ldpe-hm
+  4: ldpe-black
+  5: hdpe-bottle
+  6: metal-can
+  7: milk-packet
+  8: pp-bag
+  9: mlp-packet
+  10: sachet
+  11: tetrapack
+  12: cardboard-brown
+  13: paper-box
+  14: coconut-shell
+  15: footwear
+  16: idpe-colored
+  17: hard-plastic
+  18: other
+
+class_conf:
+  0: 0.75
+  1: 0.80
+  2: 0.4
+  3: 0.3
+  4: 0.3
+  5: 0.4
+  6: 0.3
+  7: 0.3
+  8: 0.65
+  9: 0.6
+  10: 0.6
+  11: 0.3
+  12: 0.6
+  13: 0.8
+  14: 0.5
+  15: 0.4
+  16: 0.55
+  17: 0.55
+  18: 0.8
+
+class_size:
+  0:  {small: 10000, large: 50000}   # pet-bottle-clear
+  1:  {small: 10000, large: 50000}   # pet-bottle-green
+  2:  {small: 5000,  large: 25000}   # ldpe-clear
+  3:  {small: 5000,  large: 25000}   # ldpe-hm
+  4:  {small: 5000,  large: 25000}   # ldpe-black
+  5:  {small: 10000, large: 50000}   # hdpe-bottle
+  6:  {small: 8000,  large: 40000}   # metal-can
+  7:  {small: 5000,  large: 25000}   # milk-packet
+  8:  {small: 15000, large: 70000}   # pp-bag
+  9:  {small: 3000,  large: 15000}   # mlp-packet
+  10: {small: 3000,  large: 15000}   # sachet
+  11: {small: 15000, large: 60000}   # tetrapack
+  12: {small: 20000, large: 80000}   # cardboard-brown
+  13: {small: 15000, large: 60000}   # paper-box
+  14: {small: 10000, large: 50000}   # coconut-shell
+  15: {small: 10000, large: 50000}   # footwear
+  16: {small: 5000,  large: 25000}   # idpe-colored
+  17: {small: 10000, large: 50000}   # hard-plastic
+  18: {small: 10000, large: 50000}   # other
