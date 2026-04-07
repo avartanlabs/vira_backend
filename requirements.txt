@@ -1,0 +1,15 @@
+aiofiles==25.1.0
+azure-core==1.39.0
+azure-storage-blob==12.28.0
+celery==5.6.3
+fastapi==0.135.3
+python-multipart==0.0.24
+PyMySQL==1.1.2
+pydantic==2.12.5
+pydantic-settings==2.13.1
+python-dotenv==1.2.2
+redis==6.4.0
+SQLAlchemy==2.0.49
+uvicorn==0.43.0
+PyYAML==6.0.3
+cryptography==46.0.6
