@@ -139,7 +139,7 @@ def process_video(self, video_id: int, blob_name: str):
                 # Extract per-class IN counts from classwise_count
                 classwise = getattr(solution, 'classwise_count', {}) or {}
                 for class_name, counts in classwise.items():
-                    current_in = counts.get("OUT", 0)
+                    current_in = counts.get("IN", 0)
                     prev_in    = prev_class_in[class_name]
                     new_in     = current_in - prev_in
                     if new_in > 0:
