@@ -5,8 +5,6 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.video import Video
 from app.schemas.video import VideoUploadResponse, VideoStatusResponse
-from app.storage import upload_to_blob
-from app.workers.tasks import process_video
 
 router = APIRouter()
 
@@ -19,16 +17,17 @@ async def upload_video(
     mrf_id: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith((".mp4",".h264", ".avi", ".mkv")):
+    if not file.filename.endswith((".mp4", ".avi", ".mkv", ".h264")):
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     # Save chunks to local temp file first
     temp_path = os.path.join(UPLOAD_DIR, f"{mrf_id}_{file.filename}")
     async with aiofiles.open(temp_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):  # 1MB chunks
+        while chunk := await file.read(1024 * 1024):
             await f.write(chunk)
 
     # Upload to Azure Blob
+    from app.storage import upload_to_blob  # lazy import
     blob_name = f"{mrf_id}/{file.filename}"
     blob_url = upload_to_blob(temp_path, blob_name)
 
@@ -46,7 +45,8 @@ async def upload_video(
     db.commit()
     db.refresh(video)
 
-    # Queue job with blob name
+    # Queue job — lazy import so CPU VM never loads ultralytics
+    from app.workers.tasks import process_video
     process_video.delay(video.id, blob_name)
 
     return VideoUploadResponse(
