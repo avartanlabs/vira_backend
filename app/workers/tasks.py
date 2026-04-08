@@ -48,7 +48,7 @@ def patch_counter_model(counter, model, thresholds, device):
     original_track = model.track
 
     def filtered_track(source, *args, **kwargs):
-        kwargs['conf']    = 0.01   # low conf — we filter manually per class
+        kwargs['conf']    = 0.01
         kwargs['device']  = device
         kwargs['verbose'] = False
         results = original_track(source, *args, **kwargs)
@@ -59,7 +59,7 @@ def patch_counter_model(counter, model, thresholds, device):
 
 
 # ── Load config once at module level ──────────────────────
-DATA_YAML_PATH = os.path.join(os.path.dirname(settings.MODEL_PATH), "data.yaml")
+DATA_YAML_PATH = settings.DATA_YAML_PATH
 thresholds, class_names = load_class_config(DATA_YAML_PATH)
 
 
@@ -108,7 +108,7 @@ def process_video(self, video_id: int, blob_name: str):
         counter = object_counter.ObjectCounter(
             model=settings.MODEL_PATH,
             region=[(0, line_y), (width, line_y)],
-            conf=0.01,       # will be overridden by patch
+            conf=0.01,
             device='0',
             show=False,
             verbose=False
@@ -117,13 +117,10 @@ def process_video(self, video_id: int, blob_name: str):
         model = RTDETR(settings.MODEL_PATH)
         patch_counter_model(counter, model, thresholds, '0')
 
-        # 6. Track per-class IN counts
-        prev_class_in  = defaultdict(int)
-        class_in_total = defaultdict(int)
-
-        # 7. Process frames
+        # 6. Process frames — no per-frame counting needed
         frame_idx = 0
         processed = 0
+        solution  = None
 
         print(f"[{video_id}] Processing at 5fps (every {sample_every} frames)...")
         while True:
@@ -136,38 +133,43 @@ def process_video(self, video_id: int, blob_name: str):
                 out.write(solution.plot_im)
                 processed += 1
 
-                # Extract per-class IN counts from classwise_count
-                classwise = getattr(solution, 'classwise_count', {}) or {}
-                for class_name, counts in classwise.items():
-                    current_in = counts.get("IN", 0)
-                    prev_in    = prev_class_in[class_name]
-                    new_in     = current_in - prev_in
-                    if new_in > 0:
-                        class_in_total[class_name] += new_in
-                    prev_class_in[class_name] = current_in
-
             frame_idx += 1
 
         cap.release()
         out.release()
 
-        # 8. Total IN count across all classes
-        total_in = sum(class_in_total.values())
-        print(f"[{video_id}] Done. Total IN={total_in}")
-        for cls, cnt in sorted(class_in_total.items()):
-            print(f"  {cls}: {cnt}")
+        # 7. Auto-detect belt direction — whichever total is higher wins
+        total_in_all  = counter.in_count
+        total_out_all = counter.out_count
+        use_out       = total_out_all > total_in_all
+        direction     = "OUT (bottom→top)" if use_out else "IN (top→bottom)"
+        print(f"[{video_id}] Belt direction detected: {direction} (IN={total_in_all} OUT={total_out_all})")
 
-        # 9. Upload output video to Blob
+        # 8. Build per-class counts based on detected direction
+        class_in_total = defaultdict(int)
+        classwise_final = {}
+        if solution is not None:
+            classwise_final = getattr(solution, 'classwise_count', {}) or {}
+
+        for class_name, counts in classwise_final.items():
+            if use_out:
+                class_in_total[class_name] = counts.get("OUT", 0)
+            else:
+                class_in_total[class_name] = counts.get("IN", 0)
+
+        # 9. Total count across all classes
+        total_in = sum(class_in_total.values())
+        print(f"[{video_id}] Done. Total={total_in}")
+        for cls, cnt in sorted(class_in_total.items()):
+            if cnt > 0:
+                print(f"  {cls}: {cnt}")
+
+        # 10. Upload output video to Blob
         output_blob_name = f"outputs/{video.mrf_id}/{filename}.mp4"
         output_url       = upload_to_blob(local_output, output_blob_name)
         delete_from_blob(blob_name)
 
-        # Map class names from yaml to DB column names
-        # e.g. "pet-bottle-clear" → "pet_bottle_clear"
-        def to_col(name):
-            return name.replace("-", "_")
-
-        # 10. Save inference result with all class counts
+        # 11. Save inference result with all class counts
         inference_result = InferenceResult(
             video_id=video_id,
             mrf_id=video.mrf_id,
@@ -175,7 +177,6 @@ def process_video(self, video_id: int, blob_name: str):
             processed_frames=processed,
             total_frames=total_frames,
             output_video_url=output_url,
-            # Set each class column — default 0 if not detected
             pet_bottle_clear = class_in_total.get("pet-bottle-clear", 0),
             pet_bottle_green = class_in_total.get("pet-bottle-green", 0),
             ldpe_clear       = class_in_total.get("ldpe-clear", 0),
@@ -208,6 +209,7 @@ def process_video(self, video_id: int, blob_name: str):
             "status": "done",
             "video_id": video_id,
             "total_in": total_in,
+            "direction": direction,
             "class_counts": dict(class_in_total)
         }
 
