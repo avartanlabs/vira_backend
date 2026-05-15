@@ -5,9 +5,8 @@ from app.models.result import InferenceResult
 from app.storage import download_from_blob, delete_from_blob, upload_to_blob
 from app.config import settings
 from ultralytics import RTDETR
-from ultralytics.solutions import object_counter
 from ultralytics.utils import LOGGER
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
 import cv2
 import os
@@ -29,7 +28,7 @@ def load_class_config(yaml_path, num_classes=19, default_conf=0.55):
 
 
 # ── Per-class confidence filter ───────────────────────────
-def filter_by_class_conf(results, thresholds):
+def filter_detections(results, thresholds):
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
         return results
@@ -43,24 +42,12 @@ def filter_by_class_conf(results, thresholds):
     return results
 
 
-# ── Patch counter to use per-class thresholds ─────────────
-def patch_counter_model(counter, model, thresholds, device):
-    original_track = model.track
-
-    def filtered_track(source, *args, **kwargs):
-        kwargs['conf']    = 0.01
-        kwargs['device']  = device
-        kwargs['verbose'] = False
-        results = original_track(source, *args, **kwargs)
-        results = filter_by_class_conf(results, thresholds)
-        return results
-
-    counter.model.track = filtered_track
-
-
 # ── Load config once at module level ──────────────────────
 DATA_YAML_PATH = settings.DATA_YAML_PATH
 thresholds, class_names = load_class_config(DATA_YAML_PATH)
+
+# Disappear buffer — number of frames a track must be absent before counting
+DISAPPEAR_BUFFER = 50
 
 
 @celery.task(bind=True)
@@ -95,72 +82,99 @@ def process_video(self, video_id: int, blob_name: str):
         out = cv2.VideoWriter(
             local_output,
             cv2.VideoWriter_fourcc(*"mp4v"),
-            5,
+            5,  # output at 5fps
             (width, height)
         )
 
-        # 5. Setup counter + patch with per-class thresholds
-        line_y       = height // 2
-        sample_every = max(1, round(fps / 5))
-
-        print(f"[{video_id}] Initializing counter (line_y={line_y}, sample_every={sample_every})...")
-
-        counter = object_counter.ObjectCounter(
-            model=settings.MODEL_PATH,
-            region=[(0, line_y), (width, line_y)],
-            conf=0.01,
-            device='0',
-            show=False,
-            verbose=False
-        )
-
+        # 5. Load model
+        print(f"[{video_id}] Loading model...")
         model = RTDETR(settings.MODEL_PATH)
-        patch_counter_model(counter, model, thresholds, '0')
 
-        # 6. Process frames — no per-frame counting needed
-        frame_idx = 0
-        processed = 0
-        solution  = None
+        # 6. ByteTrack majority voting state
+        track_history      = defaultdict(list)   # track_id → [class_id, ...]
+        prev_track_ids     = set()
+        disappeared_counter = defaultdict(int)   # track_id → frames absent
+        final_counts       = Counter()           # class_name → count
+
+        # 7. Process frames at 5fps
+        sample_every = max(1, round(fps / 5))
+        frame_idx    = 0
+        processed    = 0
 
         print(f"[{video_id}] Processing at 5fps (every {sample_every} frames)...")
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
             if frame_idx % sample_every == 0:
-                solution = counter(frame)
-                out.write(solution.plot_im)
+                # Run tracking with low conf — filter per class manually
+                results = model.track(
+                    frame,
+                    conf=0.01,
+                    device='0',
+                    tracker="bytetrack.yaml",
+                    persist=True,
+                    verbose=False
+                )
+
+                # Apply per-class confidence filter
+                results = filter_detections(results, thresholds)
+
+                current_track_ids = set()
+
+                if results[0].boxes is not None and results[0].boxes.id is not None:
+                    boxes     = results[0].boxes
+                    track_ids = boxes.id.int().cpu().tolist()
+                    class_ids = boxes.cls.int().cpu().tolist()
+
+                    for track_id, class_id in zip(track_ids, class_ids):
+                        track_history[track_id].append(class_id)
+                        current_track_ids.add(track_id)
+
+                # Track disappeared objects
+                disappeared_ids = prev_track_ids - current_track_ids
+                for tid in disappeared_ids:
+                    disappeared_counter[tid] += 1
+
+                # Count tracks that have been gone long enough
+                for tid in list(disappeared_counter.keys()):
+                    if tid in current_track_ids:
+                        # Reappeared — reset counter
+                        del disappeared_counter[tid]
+                    elif disappeared_counter[tid] >= DISAPPEAR_BUFFER:
+                        # Gone long enough — majority vote and count
+                        if track_history[tid]:
+                            majority_cls = Counter(track_history[tid]).most_common(1)[0][0]
+                            class_name   = model.names[majority_cls]
+                            final_counts[class_name] += 1
+                        del track_history[tid]
+                        del disappeared_counter[tid]
+
+                prev_track_ids = current_track_ids
+
+                # Draw and write annotated frame
+                annotated = results[0].plot()
+                out.write(annotated)
                 processed += 1
 
             frame_idx += 1
 
+        # 8. Count any tracks still active at end of video
+        for tid, predictions in track_history.items():
+            if predictions:
+                majority_cls = Counter(predictions).most_common(1)[0][0]
+                class_name   = model.names[majority_cls]
+                final_counts[class_name] += 1
+
         cap.release()
         out.release()
 
-        # 7. Auto-detect belt direction — whichever total is higher wins
-        total_in_all  = counter.in_count
-        total_out_all = counter.out_count
-        use_out       = total_out_all > total_in_all
-        direction     = "OUT (bottom→top)" if use_out else "IN (top→bottom)"
-        print(f"[{video_id}] Belt direction detected: {direction} (IN={total_in_all} OUT={total_out_all})")
-
-        # 8. Build per-class counts based on detected direction
-        class_in_total = defaultdict(int)
-        classwise_final = {}
-        if solution is not None:
-            classwise_final = getattr(solution, 'classwise_count', {}) or {}
-
-        for class_name, counts in classwise_final.items():
-            if use_out:
-                class_in_total[class_name] = counts.get("OUT", 0)
-            else:
-                class_in_total[class_name] = counts.get("IN", 0)
-
-        # 9. Total count across all classes
-        total_in = sum(class_in_total.values())
-        print(f"[{video_id}] Done. Total={total_in}")
-        for cls, cnt in sorted(class_in_total.items()):
+        # 9. Summary
+        total_count = sum(final_counts.values())
+        print(f"[{video_id}] Done. Total={total_count}")
+        for cls, cnt in sorted(final_counts.items()):
             if cnt > 0:
                 print(f"  {cls}: {cnt}")
 
@@ -169,33 +183,33 @@ def process_video(self, video_id: int, blob_name: str):
         output_url       = upload_to_blob(local_output, output_blob_name)
         delete_from_blob(blob_name)
 
-        # 11. Save inference result with all class counts
+        # 11. Save inference result
         inference_result = InferenceResult(
             video_id=video_id,
             mrf_id=video.mrf_id,
-            total_count=total_in,
+            total_count=total_count,
             processed_frames=processed,
             total_frames=total_frames,
             output_video_url=output_url,
-            pet_bottle_clear = class_in_total.get("pet-bottle-clear", 0),
-            pet_bottle_green = class_in_total.get("pet-bottle-green", 0),
-            ldpe_clear       = class_in_total.get("ldpe-clear", 0),
-            ldpe_hm          = class_in_total.get("ldpe-hm", 0),
-            ldpe_black       = class_in_total.get("ldpe-black", 0),
-            hdpe_bottle      = class_in_total.get("hdpe-bottle", 0),
-            metal_can        = class_in_total.get("metal-can", 0),
-            milk_packet      = class_in_total.get("milk-packet", 0),
-            pp_bag           = class_in_total.get("pp-bag", 0),
-            mlp_packet       = class_in_total.get("mlp-packet", 0),
-            sachet           = class_in_total.get("sachet", 0),
-            tetrapack        = class_in_total.get("tetrapack", 0),
-            cardboard_brown  = class_in_total.get("cardboard-brown", 0),
-            paper_box        = class_in_total.get("paper-box", 0),
-            coconut_shell    = class_in_total.get("coconut-shell", 0),
-            footwear         = class_in_total.get("footwear", 0),
-            idpe_colored     = class_in_total.get("idpe-colored", 0),
-            hard_plastic     = class_in_total.get("hard-plastic", 0),
-            other            = class_in_total.get("other", 0),
+            pet_bottle_clear = final_counts.get("pet-bottle-clear", 0),
+            pet_bottle_green = final_counts.get("pet-bottle-green", 0),
+            ldpe_clear       = final_counts.get("ldpe-clear", 0),
+            ldpe_hm          = final_counts.get("ldpe-hm", 0),
+            ldpe_black       = final_counts.get("ldpe-black", 0),
+            hdpe_bottle      = final_counts.get("hdpe-bottle", 0),
+            metal_can        = final_counts.get("metal-can", 0),
+            milk_packet      = final_counts.get("milk-packet", 0),
+            pp_bag           = final_counts.get("pp-bag", 0),
+            mlp_packet       = final_counts.get("mlp-packet", 0),
+            sachet           = final_counts.get("sachet", 0),
+            tetrapack        = final_counts.get("tetrapack", 0),
+            cardboard_brown  = final_counts.get("cardboard-brown", 0),
+            paper_box        = final_counts.get("paper-box", 0),
+            coconut_shell    = final_counts.get("coconut-shell", 0),
+            footwear         = final_counts.get("footwear", 0),
+            idpe_colored     = final_counts.get("idpe-colored", 0),
+            hard_plastic     = final_counts.get("hard-plastic", 0),
+            other            = final_counts.get("other", 0),
         )
         db.add(inference_result)
 
@@ -208,9 +222,8 @@ def process_video(self, video_id: int, blob_name: str):
         return {
             "status": "done",
             "video_id": video_id,
-            "total_in": total_in,
-            "direction": direction,
-            "class_counts": dict(class_in_total)
+            "total_count": total_count,
+            "class_counts": dict(final_counts)
         }
 
     except Exception as e:
@@ -228,4 +241,23 @@ def process_video(self, video_id: int, blob_name: str):
         for f in [local_input, local_output]:
             if os.path.exists(f):
                 os.remove(f)
+        db.close()
+
+
+@celery.task
+def recover_stuck_jobs():
+    db = SessionLocal()
+    try:
+        from datetime import datetime, timedelta
+        cutoff = datetime.utcnow() - timedelta(minutes=10)
+        stuck = db.query(Video).filter(
+            Video.status == "queued",
+            Video.created_at < cutoff
+        ).all()
+        for video in stuck:
+            blob_name = f"{video.mrf_id}/{video.filename}"
+            process_video.delay(video.id, blob_name)
+            print(f"[RECOVER] Re-queued video {video.id} - {video.filename}")
+        return len(stuck)
+    finally:
         db.close()
